@@ -9,9 +9,12 @@ import logging
 import logging.handlers
 import inspect
 import signal
+from threading import Thread
+from telegram.ext import Updater
 
 
 TERMINATED = False
+DEBUG = True
 
 
 def whoami():
@@ -30,13 +33,87 @@ class SigHandler:
         TERMINATED = True
 
 
-def ping(iplist):
-    # -10 not pinged yet, -1 error, 0 failed, 1 success
-    reslist = [(ip, -10) for ip in iplist]
-    for i, ip in enumerate(iplist):
-        command = ['ping', "-c", '1', "-W", "2", ip]
+class Interface(Thread):
+    def __init__(self, host, ssh_user, ssh_pass, t_token, t_chatid, ping_freq, tbot, if0, logger):
+        # interface_ip = pfsense side of modem dchp
+        # gateway_ip = ip of modem
+        Thread.__init__(self)
+        self.daemon = True
+        self.logger = logger
+        self.running = False
+        self.host = host
+        self.ssh_user = ssh_user
+        self.ssh_pass = ssh_pass
+        self.t_token = t_token
+        self.t_chatid = t_chatid
+        self.ping_freq = ping_freq
+        self.tbot = tbot
+        self.name = if0["name"]
+        self.gateway_ip = if0["gateway_ip"]
+        self.interface_ip = if0["interface_ip"]
+        self.pfsense_name = if0["pfsense_name"]
+        self.status_gateway = 0
+        # 1=up & ok / -1=down
+        self.status_interface = 0
+        self.ssh_connect()
+        # ping google dns from pfsense interface
+        # !!! -> ssh_user has to be root for this to work on pfsense, not admin !!!
+        self.interface_command = "ping -c 1 -W " + str(self.ping_freq) + " -S " + self.interface_ip + " 8.8.8.8"
+        # ping modem from this host
+        self.gateway_command = ["ping", "-c", "1", "-W", str(self.ping_freq), self.gateway_ip]
+
+    def ssh_connect(self):
         try:
-            resp = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.ssh = paramiko.SSHClient()
+            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.ssh.connect(self.host, username=self.ssh_user, password=self.ssh_pass)
+            self.logger.info(whoami() + "connected to " + self.name + "!")
+            return True
+        except Exception as e:
+            self.logger.warning(whoami() + str(e) + ": cannot ssh_connect to " + self.name)
+            self.ssh = None
+            self.status_interface = 0  # cannot ssh
+            return False
+
+    def get_interface_status(self):
+        # ping -c 1 -W 5 -S 192.168.2.2 8.8.8.8
+        try:
+            transport = self.ssh.get_transport()
+            transport.send_ignore()
+        except Exception as e:
+            self.logger.warning(whoami() + str(e) + ": " + self.name)
+            ret = self.ssh_connect()
+            if not ret:
+                return 0
+        try:
+            stdin, stdout, stderr = self.ssh.exec_command(self.interface_command)
+            stdout.channel.recv_exit_status()
+            resp_stdout = stdout.readlines()
+            resp_stderr = stderr.readlines()
+            # check if stderr
+            err0 = False
+            for err in resp_stderr:
+                if err:
+                    err0 = True 
+                    break
+            if err0:
+                return -1
+            # check stdout if ok
+            success0 = False
+            for std in resp_stdout:
+                if "1 packets received" in std:
+                    success0 = True
+                    break
+            if success0:
+                return 1
+            return -1
+        except Exception as e:
+            self.logger.warning(whoami() + str(e) + ": " + self.name)
+            return 0
+
+    def get_gateway_status(self):
+        try:
+            resp = subprocess.Popen(self.gateway_command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             resp_stdout = resp.stdout.readlines()
             resp_stderr = resp.stderr.readlines()
             err0 = None
@@ -46,7 +123,7 @@ def ping(iplist):
                     reslist[i] = (-1, ip)
                     break
             if err0:
-                continue
+                return -1
             success = False
             for std in resp_stdout:
                 std0 = std.decode("utf-8")
@@ -54,14 +131,114 @@ def ping(iplist):
                     success = True
                     break
             if success:
-                reslist[i] = (1, ip)
-            else:
-                reslist[i] = (0, ip)
+                return 1
+            return -1
         except Exception as e:
-            print(str(e))
-            reslist[i] = (-1, ip)
-    return reslist
+            self.logger.warning(whoami() + str(e) + ": " + self.name)
+            return 0
+        
 
+    def stop(self):
+        self.running = False
+        self.logger.debug("stopping " + self.name + " thread ...")
+
+    def run(self):
+        self.running = True
+        while self.running:
+            # first ping 8.8.8.8 from pfsense outer interface
+            if_status_new = self.get_interface_status()
+            self.logger.debug(whoami() + "INTERFACE - " + self.name + ": status = " + str(if_status_new))
+            if self.status_interface != if_status_new:
+                statusstring = "INTERFACE - " + self.name + ": status changed from " + str(self.status_interface) + " to " + str(if_status_new)
+                self.logger.info(whoami() + statusstring)
+                self.tbot.send(statusstring)
+                self.status_interface = if_status_new
+            # only check ping to modem if internet (interface) is up
+            # (otherwise maybe modem is restarting etc.)
+            if self.status_interface == 1:
+                gw_status_new = self.get_gateway_status()
+                self.logger.debug(whoami() + "GATEWAY - " + self.name + ": status = " + str(gw_status_new))
+                if self.status_gateway != gw_status_new:
+                    statusstring = "GATEWAY - " + self.name + ": status changed from " + str(self.status_gateway) + " to " + str(gw_status_new)
+                    self.logger.info(whoami() + statusstring)
+                    self.tbot.send(statusstring)
+                    self.status_gateway = gw_status_new
+                    # here: restart interface via paramiko on pfsense
+                    # /etc/rc.linkup stop igb2
+                    # time.sleep(30)
+                    # /etc/rc.linkup start igb2
+            time.sleep(self.ping_freq)
+        self.logger.info("... " + self.name + " thread stopped!")
+
+
+class TelegramBot:
+    def __init__(self, config, logger):
+        self.token = config["t_token"]
+        self.chatid = config["t_chatid"]
+        self.logger = logger
+        self.status = False
+        self.setup_bot()
+
+    def setup_bot(self):
+        try:
+            self.updater = Updater(self.token, use_context=True)
+            self.bot = self.updater.bot
+            self.logger.info(whoami() + "init telegram bot success!")
+            self.status = True
+        except Exception as e:
+            self.logger.error(whoami() + str(e) + ": cannot init telegram bot!")
+            self.status = False
+
+    def stop_bot(self):
+        if not self.status:
+            return
+        self.send("pfintchk telegram bot stopped!")
+        self.updater.stop()
+        self.logger.info(whoami() + "telegram bot stopped!")
+
+    def send(self, text):
+        if not self.status:
+            return
+        try:
+            self.bot.send_message(chat_id=self.chatid, text=text)
+        except Exception as e:
+            self.logger.warning(whoami() + str(e) + ": chat_id " + str(self.chatid))
+
+
+def ReadConfig(cfg, logger):
+    config = {}
+    try:
+        config["ssh_user"] = cfg["OPTIONS"]["ssh_user"]
+        config["ssh_pass"] = cfg["OPTIONS"]["ssh_pass"]
+        config["host"] = cfg["OPTIONS"]["host"]
+        config["ping_freq"] = int(cfg["OPTIONS"]["ping_freq"])
+        config["t_token"] = cfg["TELEGRAM"]["token"]
+        config["t_chatid"] = int(cfg["TELEGRAM"]["chatid"])
+    except Exception as e:
+        logger.error(whoami() + str(e))
+        return None
+    config["interfaces"] = []
+    idx = 1
+    while True:
+        try:
+            str0 = "INTERFACE" + str(idx)
+            name = cfg[str0]["name"]
+            interface_ip = cfg[str0]["interface_ip"]
+            gateway_ip = cfg[str0]["gateway_ip"]
+            pfsense_name = cfg[str0]["pfsense_name"]
+            idata = {
+                "name": name,
+                "pfsense_name": pfsense_name,
+                "interface_ip": interface_ip,
+                "gateway_ip": gateway_ip
+            }
+            config["interfaces"].append(idata)
+        except Exception:
+            break
+        idx += 1
+    if idx == 1:
+        return None
+    return config
 
 def run():
     # set up dirs
@@ -88,26 +265,36 @@ def run():
         cfg_file = maindir + "pfintchk.cfg"
         cfg = configparser.ConfigParser()
         cfg.read(cfg_file)
-        iplist_raw = cfg["OPTIONS"]["IPLIST"]
-        iplist = json.loads(iplist_raw)
-        ssh_user = cfg["OPTIONS"]["SSH_USER"]
-        ssh_pass = cfg["OPTIONS"]["SSH_PASS"]
-        if not iplist:
-            print("!!!")
-            raise ValueError("invalid / empty ip list!")
-        logger.info(whoami() + "config read ok!")
+        config = ReadConfig(cfg, logger)
+        if config:
+            logger.info(whoami() + "config read ok!")
+        else:
+            raise ValueError("error in reading config")
     except Exception as e:
         logger.error(whoami() + str(e))
         return -1
 
+    # telegram
+    tbot = TelegramBot(config, logger)
+    if not tbot.status:
+        logger.error(whoami() + "error in telegram bot set up!")
+        return -1
+    tbot.send("pfintchk telegram bot started!")
+
+    # setup threads per interface
+    threadlist = []
+    for if0 in config["interfaces"]:
+        thr = Interface(config["host"], config["ssh_user"], config["ssh_pass"], config["t_token"],
+                        config["t_chatid"], config["ping_freq"], tbot, if0, logger)
+        threadlist.append(thr)
+        thr.start()
+
     # main loop
     while not TERMINATED:
-        reslist = ping(iplist)
-        for resultcode, ip in reslist:
-            if resultcode == 0:
-                logger.warning(whoami() + ip + ": err code " + str(resultcode) + " - no success, restarting interface!")
-                # hier ssh into pfsense & restart interface
-                pass
         time.sleep(1)
 
+    # shutdown
+    for thr in threadlist:
+        thr.stop()
+    tbot.stop_bot()
     logger.info(whoami() + " ... exited!")
