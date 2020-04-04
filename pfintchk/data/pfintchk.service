@@ -1,0 +1,14 @@
+[Unit]
+Description=pfintchk
+After=network.target media-nfs-development.mount redis.service
+
+[Service]
+#Type=forking
+User=stephan
+WorkingDirectory=/media/nfs/development/GIT/pfintchk
+ExecStart=/home/user/.pfintchk/pfintchkstart.sh
+ExecStop=/home/user/.pfintchk/pfintchkstop.sh
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
