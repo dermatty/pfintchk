@@ -149,16 +149,16 @@ class Interface(Thread):
         while self.running:
             # first ping 8.8.8.8 from pfsense outer interface
             if_status_new = self.get_interface_status()
-            self.logger.debug(whoami() + "INTERFACE - " + self.name + ": status = " + str(if_status_new))
+            self.logger.debug(whoami() + "INTERFACE " + self.name + " status = " + str(if_status_new))
             if self.status_interface != if_status_new:
-                self.logger.info(whoami() + "INTERFACE - " + self.name + ": status changed, probing max. 3x again ...")
+                self.logger.info(whoami() + "INTERFACE " + self.name + " status changed, probing max. 3x again ...")
                 for _ in range(3):
                     time.sleep(self.ping_freq)
                     if_status_new_new = self.get_interface_status()
                     if if_status_new_new != if_status_new:
                         break
                 if if_status_new_new == if_status_new:
-                    statusstring = "INTERFACE - " + self.name + ": status changed from " + str(self.status_interface) + " to " + str(if_status_new)
+                    statusstring = "INTERFACE " + self.name + " status changed from " + str(self.status_interface) + " to " + str(if_status_new)
                     self.logger.info(whoami() + statusstring)
                     self.tbot.send(statusstring)
                     self.status_interface = if_status_new
@@ -166,22 +166,27 @@ class Interface(Thread):
             # (otherwise maybe modem is restarting etc.)
             if self.status_interface == 1:
                 gw_status_new = self.get_gateway_status()
-                self.logger.debug(whoami() + "GATEWAY - " + self.name + ": status = " + str(gw_status_new))
+                self.logger.debug(whoami() + "GATEWAY " + self.name + " status = " + str(gw_status_new))
                 if self.status_gateway != gw_status_new:
-                    self.logger.info(whoami() + "GATEWAY - " + self.name + ": status changed, probing max. 3x again ...")
+                    self.logger.info(whoami() + "GATEWAY " + self.name + " status changed, probing max. 3x again ...")
                     for _ in range(3):
                         time.sleep(self.ping_freq)
                         gw_status_new_new = self.get_gateway_status()
                         if gw_status_new_new != gw_status_new:
                             break
                     if gw_status_new_new == gw_status_new:
-                        statusstring = "GATEWAY - " + self.name + ": status changed from " + str(self.status_gateway) + " to " + str(gw_status_new)
+                        statusstring = "GATEWAY " + self.name + " status changed from " + str(self.status_gateway) + " to " + str(gw_status_new)
                         self.logger.info(whoami() + statusstring)
                         self.tbot.send(statusstring)
                         self.status_gateway = gw_status_new
                         if self.status_gateway == -1:
-                            self.logger.info(whoami() + "GATEWAY - " + self.name + " is down, restarting ...")
-                            self.restart_gateway()
+                            self.logger.info(whoami() + "GATEWAY " + self.name + " connection is down, restarting interface ...")
+                            self.tbot.send("GATEWAY " + self.name + "/" + self.pfsense_name + " connection is down, restarting interface ...")
+                            ret = self.restart_gateway()
+                            if ret == 1:
+                                self.tbot.send("GATEWAY " + self.name + "/" + self.pfsense_name + " if connection restart success!")
+                            else:
+                                self.tbot.send("GATEWAY " + self.name + "/" + self.pfsense_name + " if connection restart FAILURE!!")
             time.sleep(self.ping_freq)
         self.logger.info(whoami() + "... " + self.name + " thread stopped!")
 
