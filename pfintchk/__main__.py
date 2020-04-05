@@ -59,6 +59,8 @@ class Interface(Thread):
         # ping google dns from pfsense interface
         # !!! -> ssh_user has to be root for this to work on pfsense, not admin !!!
         self.interface_command = "ping -c 1 -W " + str(self.ping_freq) + " -S " + self.interface_ip + " 8.8.8.8"
+        self.interface_stop = "/etc/rc.linkup stop " + self.pfsense_name
+        self.interface_start = "/etc/rc.linkup start " + self.pfsense_name
         # ping modem from this host
         self.gateway_command = ["ping", "-c", "1", "-W", str(self.ping_freq), self.gateway_ip]
 
@@ -149,27 +151,93 @@ class Interface(Thread):
             if_status_new = self.get_interface_status()
             self.logger.debug(whoami() + "INTERFACE - " + self.name + ": status = " + str(if_status_new))
             if self.status_interface != if_status_new:
-                statusstring = "INTERFACE - " + self.name + ": status changed from " + str(self.status_interface) + " to " + str(if_status_new)
-                self.logger.info(whoami() + statusstring)
-                self.tbot.send(statusstring)
-                self.status_interface = if_status_new
+                self.logger.info(whoami() + "INTERFACE - " + self.name + ": status changed, probing max. 3x again ...")
+                for _ in range(3):
+                    time.sleep(self.ping_freq)
+                    if_status_new_new = self.get_interface_status()
+                    if if_status_new_new != if_status_new:
+                        break
+                if if_status_new_new == if_status_new:
+                    statusstring = "INTERFACE - " + self.name + ": status changed from " + str(self.status_interface) + " to " + str(if_status_new)
+                    self.logger.info(whoami() + statusstring)
+                    self.tbot.send(statusstring)
+                    self.status_interface = if_status_new
             # only check ping to modem if internet (interface) is up
             # (otherwise maybe modem is restarting etc.)
             if self.status_interface == 1:
                 gw_status_new = self.get_gateway_status()
                 self.logger.debug(whoami() + "GATEWAY - " + self.name + ": status = " + str(gw_status_new))
                 if self.status_gateway != gw_status_new:
-                    statusstring = "GATEWAY - " + self.name + ": status changed from " + str(self.status_gateway) + " to " + str(gw_status_new)
-                    self.logger.info(whoami() + statusstring)
-                    self.tbot.send(statusstring)
-                    self.status_gateway = gw_status_new
-                    # here: restart interface via paramiko on pfsense
-                    # /etc/rc.linkup stop igb2
-                    # time.sleep(30)
-                    # /etc/rc.linkup start igb2
+                    self.logger.info(whoami() + "GATEWAY - " + self.name + ": status changed, probing max. 3x again ...")
+                    for _ in range(3):
+                        time.sleep(self.ping_freq)
+                        gw_status_new_new = self.get_gateway_status()
+                        if gw_status_new_new != gw_status_new:
+                            break
+                    if gw_status_new_new == gw_status_new:
+                        statusstring = "GATEWAY - " + self.name + ": status changed from " + str(self.status_gateway) + " to " + str(gw_status_new)
+                        self.logger.info(whoami() + statusstring)
+                        self.tbot.send(statusstring)
+                        self.status_gateway = gw_status_new
+                        if self.status_gateway == -1:
+                            self.logger.info(whoami() + "GATEWAY - " + self.name + " is down, restarting ...")
+                            self.restart_gateway()
             time.sleep(self.ping_freq)
-        self.logger.info("... " + self.name + " thread stopped!")
+        self.logger.info(whoami() + "... " + self.name + " thread stopped!")
 
+    def restart_gateway(self):
+        connected = False
+        for _ in range(3):
+            try:
+                transport = self.ssh.get_transport()
+                transport.send_ignore()
+                connected = True
+                break
+            except Exception as e:
+                self.logger.warning(whoami() + str(e) + ": " + self.name)
+                ret = self.ssh_connect()
+        if not connected:
+            self.logger.warning(whoami() + self.name + " cannot establish connection!")
+            return -1
+        try:
+            # first, stop interface
+            self.logger.info(whoami() + self.name + " stopping interface ...")
+            stdin, stdout, stderr = self.ssh.exec_command(self.interface_stop)
+            stdout.channel.recv_exit_status()
+            resp_stdout = stdout.readlines()
+            resp_stderr = stderr.readlines()
+            # check if stderr
+            err0 = False
+            for err in resp_stderr:
+                if err:
+                    err0 = True 
+                    break
+            if err0:
+                self.logger.error(whoami() + self.name + ": " + str(err) + " ... cannot stop interface!")
+                return -1
+            self.logger.info(whoami() + self.name + "interface stopped, now waiting ...")
+            # obviously success, now wait
+            time.sleep(self.ping_freq * 4)
+            # now start
+            self.logger.info(whoami() + self.name + " starting interface ...")
+            stdin, stdout, stderr = self.ssh.exec_command(self.interface_start)
+            stdout.channel.recv_exit_status()
+            resp_stdout = stdout.readlines()
+            resp_stderr = stderr.readlines()
+            # check if stderr
+            err0 = False
+            for err in resp_stderr:
+                if err:
+                    err0 = True 
+                    break
+            if err0:
+                self.logger.error(whoami() + self.name + ": " + str(err) + " ... cannot start interface!")
+                return -1
+            self.logger.info(whoami() + self.name + "interface started, success!")
+            return 1
+        except Exception as e:
+            self.logger.warning(whoami() + str(e) + ": " + self.name + " error in interface restart!")
+            return -1
 
 class TelegramBot:
     def __init__(self, config, logger):
@@ -253,7 +321,7 @@ def run():
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     fh.setFormatter(formatter)
     logger.addHandler(fh)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
     # signal handler
     sh = SigHandler(logger)
